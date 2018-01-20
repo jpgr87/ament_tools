@@ -155,12 +155,19 @@ class CmakeBuildType(BuildType):
     def _make_or_ninja_build(self, context, prefix):
         if context.use_ninja:
             if NINJA_EXECUTABLE is None:
-                raise VerbExecutionError("Could not find 'make' executable")
+                raise VerbExecutionError("Could not find 'ninja' executable")
             return BuildAction(prefix + [NINJA_EXECUTABLE] + context.make_flags)
         else:
             if MAKE_EXECUTABLE is None:
                 raise VerbExecutionError("Could not find 'make' executable")
             return BuildAction(prefix + [MAKE_EXECUTABLE] + context.make_flags)
+
+    def _cmake_build(self, context, prefix):
+        if CMAKE_EXECUTABLE is None:
+            raise VerbExecutionError("Could not find 'cmake' executable")
+        config = self._get_configuration_from_cmake(context)
+        cmake_args = ['--build', '.', '--config', config, '--']
+        return BuildAction(prefix + [CMAKE_EXECUTABLE] + cmake_args + context.make_flags)
 
     def _using_xcode_generator(self, context):
         # Check CMake was invoked to generate a Xcode or Make project
@@ -179,19 +186,24 @@ class CmakeBuildType(BuildType):
             cmake_args.extend(extra_cmake_args)
             cmake_args += ['-DCMAKE_INSTALL_PREFIX=' + context.install_space]
             if IS_WINDOWS:
-                vsv = get_visual_studio_version()
-                if vsv is None:
-                    sys.stderr.write(
-                        'VisualStudioVersion is not set, '
-                        'please run within a Visual Studio Command Prompt.\n')
-                    raise VerbExecutionError('Could not determine Visual Studio Version')
-                supported_vsv = {
-                    '14.0': 'Visual Studio 14 2015 Win64',
-                    '15.0': 'Visual Studio 15 2017 Win64',
-                }
-                if vsv not in supported_vsv:
-                    raise VerbExecutionError('Unknown / unsupported VS version: ' + vsv)
-                cmake_args += ['-G', supported_vsv[vsv]]
+                if context.use_ninja is True:
+                    if NINJA_EXECUTABLE is None:
+                        raise VerbExecutionError("Could not find 'ninja' executable")
+                    cmake_args += ['-G', 'Ninja']
+                else:
+                    vsv = get_visual_studio_version()
+                    if vsv is None:
+                        sys.stderr.write(
+                            'VisualStudioVersion is not set, '
+                            'please run within a Visual Studio Command Prompt.\n')
+                        raise VerbExecutionError('Could not determine Visual Studio Version')
+                    supported_vsv = {
+                        '14.0': 'Visual Studio 14 2015 Win64',
+                        '15.0': 'Visual Studio 15 2017 Win64',
+                    }
+                    if vsv not in supported_vsv:
+                        raise VerbExecutionError('Unknown / unsupported VS version: ' + vsv)
+                    cmake_args += ['-G', supported_vsv[vsv]]
             elif IS_MACOSX:
                 if context.use_xcode or self._using_xcode_generator(context):
                     cmake_args += ['-G', 'Xcode']
@@ -209,35 +221,39 @@ class CmakeBuildType(BuildType):
             yield BuildAction(cmd)
         # Now execute the build step
         if IS_LINUX:
-            yield self._make_or_ninja_build(context, prefix)
+            #yield self._make_or_ninja_build(context, prefix)
+            yield self._cmake_build(context, prefix)
         elif IS_WINDOWS:
-            if MSBUILD_EXECUTABLE is None:
-                raise VerbExecutionError("Could not find 'msbuild' executable")
-            solution_file = solution_file_exists_at(
-                context.build_space, context.package_manifest.name)
-            cmd = prefix + [MSBUILD_EXECUTABLE]
-            env = None
-            # Convert make parallelism flags into msbuild flags
-            msbuild_flags = [
-                x.replace('-j', '/m:') for x in context.make_flags if x.startswith('-j')
-            ]
-            if msbuild_flags:
-                cmd += msbuild_flags
-                # If there is a parallelism flag in msbuild_flags and it's not /m1,
-                # then turn on /MP for the compiler (intra-project parallelism)
-                if any(x.startswith('/m') for x in msbuild_flags) and \
-                   '/m:1' not in msbuild_flags:
-                    env = dict(os.environ)
-                    if 'CL' in env:
-                        # make sure env['CL'] doesn't include an /MP already
-                        if not any(x.startswith('/MP') for x in env['CL'].split(' ')):
-                            env['CL'] += ' /MP'
-                    else:  # CL not in environment; let's add it with our flag
-                        env['CL'] = '/MP'
-            cmd += [
-                '/p:Configuration=%s' %
-                self._get_configuration_from_cmake(context), solution_file]
-            yield BuildAction(cmd, env=env)
+            if context.use_ninja is True:
+                yield self._cmake_build(context, prefix)
+            else:
+                if MSBUILD_EXECUTABLE is None:
+                    raise VerbExecutionError("Could not find 'msbuild' executable")
+                solution_file = solution_file_exists_at(
+                    context.build_space, context.package_manifest.name)
+                cmd = prefix + [MSBUILD_EXECUTABLE]
+                env = None
+                # Convert make parallelism flags into msbuild flags
+                msbuild_flags = [
+                    x.replace('-j', '/m:') for x in context.make_flags if x.startswith('-j')
+                ]
+                if msbuild_flags:
+                    cmd += msbuild_flags
+                    # If there is a parallelism flag in msbuild_flags and it's not /m1,
+                    # then turn on /MP for the compiler (intra-project parallelism)
+                    if any(x.startswith('/m') for x in msbuild_flags) and \
+                        '/m:1' not in msbuild_flags:
+                        env = dict(os.environ)
+                        if 'CL' in env:
+                            # make sure env['CL'] doesn't include an /MP already
+                            if not any(x.startswith('/MP') for x in env['CL'].split(' ')):
+                                env['CL'] += ' /MP'
+                        else:  # CL not in environment; let's add it with our flag
+                            env['CL'] = '/MP'
+                cmd += [
+                    '/p:Configuration=%s' %
+                    self._get_configuration_from_cmake(context), solution_file]
+                yield BuildAction(cmd, env=env)
         elif IS_MACOSX:
             if self._using_xcode_generator(context):
                 if XCODEBUILD_EXECUTABLE is None:
@@ -473,13 +489,20 @@ class CmakeBuildType(BuildType):
             else:
                 self.warn("Could not run installation for package '{0}' because it has no "
                           "'install' target".format(context.package_manifest.name))
+                
+    def _cmake_install(self, context, prefix):
+        if CMAKE_EXECUTABLE is None:
+            raise VerbExecutionError("Could not find 'cmake' executable")
+        config = self._get_configuration_from_cmake(context)
+        return BuildAction(prefix + [CMAKE_EXECUTABLE, '--build', '.', '--config', config, '--target', 'install'])
 
     def _common_cmake_on_install(self, context):
         # Figure out if there is a setup file to source
         prefix = self._get_command_prefix('install', context)
 
         if IS_LINUX:
-            build_action = self._make_or_ninja_install(context, prefix)
+            build_action = self._cmake_install(context, prefix)
+            #build_action = self._make_or_ninja_install(context, prefix)
             if build_action:
                 yield build_action
         elif IS_WINDOWS:
